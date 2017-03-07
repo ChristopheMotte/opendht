@@ -524,7 +524,8 @@ PublicKey::getId() const
 {
     InfoHash id;
     size_t sz = id.size();
-    if (gnutls_pubkey_get_key_id(pk, 0, id.data(), &sz) != GNUTLS_E_SUCCESS || sz != id.size())
+    constexpr int flags = (id.size() == 32) ? GNUTLS_KEYID_USE_SHA256 : 0;
+    if (gnutls_pubkey_get_key_id(pk, flags, id.data(), &sz) != GNUTLS_E_SUCCESS || sz != id.size())
         return {};
     return id;
 }
