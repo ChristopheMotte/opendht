@@ -69,6 +69,8 @@ struct OPENDHT_PUBLIC Config {
 
     /** Makes the DHT responsible to maintain its stored values. Consumes more ressources. */
     bool maintain_storage;
+
+    in_port_t port;
 };
 
 /**

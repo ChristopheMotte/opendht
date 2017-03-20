@@ -40,7 +40,7 @@ void print_id_req() {
 }
 
 void print_node_info(const std::shared_ptr<DhtRunner>& dht, const dht_params& params) {
-    std::cout << "OpenDht node " << dht->getNodeId() << " running on port " <<  dht->getBoundPort() << std::endl;
+    std::cout << "OpenDht node " << dht->getNodeId() << " running on port " <<  dht->getBound().toString() << std::endl;
     if (params.generate_identity)
         std::cout << "Public key ID " << dht->getId() << std::endl;
 }

@@ -21,98 +21,32 @@
 #include "dhtrunner.h"
 #include "securedht.h"
 
-#ifndef _WIN32
-#include <unistd.h>
-#else
-#include <io.h>
-#endif
-
-#ifndef _WIN32
-#include <sys/socket.h>
-#else
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#define close(x) closesocket(x)
-#endif
-
 namespace dht {
 
 constexpr std::chrono::seconds DhtRunner::BOOTSTRAP_PERIOD;
 
 DhtRunner::DhtRunner() : dht_()
 {
-#ifdef _WIN32
-    WSADATA wsd;
-    if (WSAStartup(MAKEWORD(2,2), &wsd) != 0)
-        throw DhtException("Can't initialize Winsock2");
-#endif
+    uv_async_.data = this;
+    uv_async_init(uv_loop_.get(), &uv_async_, &DhtRunner::loop_callback);
 }
 
 DhtRunner::~DhtRunner()
 {
     join();
-#ifdef _WIN32
-    WSACleanup();
-#endif
 }
 
 void
-DhtRunner::run(in_port_t port, DhtRunner::Config config)
-{
-    sockaddr_in sin4;
-    std::fill_n((uint8_t*)&sin4, sizeof(sin4), 0);
-    sin4.sin_family = AF_INET;
-    sin4.sin_port = htons(port);
-    sockaddr_in6 sin6;
-    std::fill_n((uint8_t*)&sin6, sizeof(sin6), 0);
-    sin6.sin6_family = AF_INET6;
-    sin6.sin6_port = htons(port);
-    run(&sin4, &sin6, config);
-}
-
-void
-DhtRunner::run(const char* ip4, const char* ip6, const char* service, DhtRunner::Config config)
-{
-    auto res4 = getAddrInfo(ip4, service);
-    auto res6 = getAddrInfo(ip6, service);
-    run(res4.empty() ? nullptr : (sockaddr_in*) &res4.front().first,
-        res6.empty() ? nullptr : (sockaddr_in6*)&res6.front().first, config);
-}
-
-void
-DhtRunner::run(const sockaddr_in* local4, const sockaddr_in6* local6, DhtRunner::Config config)
+DhtRunner::run(DhtRunner::Config config)
 {
     if (running)
         return;
-    if (rcv_thread.joinable())
-        rcv_thread.join();
     running = true;
-    doRun(local4, local6, config.dht_config);
+    doRun(config.dht_config);
     if (not config.threaded)
         return;
     dht_thread = std::thread([this]() {
-        while (running) {
-            std::unique_lock<std::mutex> lk(dht_mtx);
-            auto wakeup = loop_();
-            cv.wait_until(lk, wakeup, [this]() {
-                if (not running)
-                    return true;
-                {
-                    std::lock_guard<std::mutex> lck(sock_mtx);
-                    if (not rcv.empty())
-                        return true;
-                }
-                {
-                    std::lock_guard<std::mutex> lck(storage_mtx);
-                    if (not pending_ops_prio.empty())
-                        return true;
-                    auto s = getStatus();
-                    if (not pending_ops.empty() and (s == NodeStatus::Connected or (s == NodeStatus::Disconnected and not bootstraping)))
-                        return true;
-                }
-                return false;
-            });
-        }
+        uv_loop_.run();
     });
 }
 
@@ -122,19 +56,17 @@ DhtRunner::shutdown(ShutdownCallback cb) {
     pending_ops_prio.emplace([=](SecureDht& dht) mutable {
         dht.shutdown(cb);
     });
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
 DhtRunner::join()
 {
     running = false;
-    cv.notify_all();
+    uv_async_send(&uv_async_);
     bootstrap_cv.notify_all();
     if (dht_thread.joinable())
         dht_thread.join();
-    if (rcv_thread.joinable())
-        rcv_thread.join();
     if (bootstrap_thread.joinable())
         bootstrap_thread.join();
 
@@ -308,6 +240,11 @@ DhtRunner::getPublicAddressStr(sa_family_t af)
     return ret;
 }
 
+SockAddr 
+DhtRunner::getBound(sa_family_t f) const {
+    return dht_->getBoundAddr();
+}
+
 void
 DhtRunner::registerCertificate(std::shared_ptr<crypto::Certificate> cert) {
     std::lock_guard<std::mutex> lck(dht_mtx);
@@ -319,41 +256,11 @@ DhtRunner::setLocalCertificateStore(CertificateStoreQuery&& query_method) {
     dht_->setLocalCertificateStore(std::forward<CertificateStoreQuery>(query_method));
 }
 
-time_point
+void
 DhtRunner::loop_()
 {
     if (!dht_)
-        return {};
-
-    decltype(pending_ops) ops {};
-    {
-        std::lock_guard<std::mutex> lck(storage_mtx);
-        auto s = getStatus();
-        ops = (pending_ops_prio.empty() && (s == NodeStatus::Connected or (s == NodeStatus::Disconnected and not bootstraping))) ?
-               std::move(pending_ops) : std::move(pending_ops_prio);
-    }
-    while (not ops.empty()) {
-        ops.front()(*dht_);
-        ops.pop();
-    }
-
-    time_point wakeup {};
-    decltype(rcv) received {};
-    {
-        std::lock_guard<std::mutex> lck(sock_mtx);
-        // move to stack
-        received = std::move(rcv);
-    }
-    if (not received.empty()) {
-        for (const auto& pck : received) {
-            auto& buf = pck.first;
-            auto& from = pck.second;
-            wakeup = dht_->periodic(buf.data(), buf.size()-1, from);
-        }
-        received.clear();
-    } else {
-        wakeup = dht_->periodic(nullptr, 0, nullptr, 0);
-    }
+        return;
 
     NodeStatus nstatus4 = dht_->getStatus(AF_INET);
     NodeStatus nstatus6 = dht_->getStatus(AF_INET6);
@@ -373,101 +280,23 @@ DhtRunner::loop_()
             statusCb(status4, status6);
     }
 
-    return wakeup;
+    decltype(pending_ops) ops {};
+    {
+        std::lock_guard<std::mutex> lck(storage_mtx);
+        auto s = getStatus();
+        ops = (pending_ops_prio.empty() && (s == NodeStatus::Connected or (s == NodeStatus::Disconnected and not bootstraping))) ?
+               std::move(pending_ops) : std::move(pending_ops_prio);
+    }
+    while (not ops.empty()) {
+        ops.front()(*dht_);
+        ops.pop();
+    }
 }
 
 void
-DhtRunner::doRun(const sockaddr_in* sin4, const sockaddr_in6* sin6, SecureDht::Config config)
+DhtRunner::doRun(SecureDht::Config config)
 {
-    dht_.reset();
-
-    int s4 = -1,
-        s6 = -1;
-
-    bound4 = {};
-    if (sin4) {
-        s4 = socket(PF_INET, SOCK_DGRAM, 0);
-        if(s4 >= 0) {
-            int rc = bind(s4, (sockaddr*)sin4, sizeof(sockaddr_in));
-            if(rc < 0)
-                throw DhtException("Can't bind IPv4 socket on " + dht::print_addr((sockaddr*)sin4, sizeof(sockaddr_in)));
-            bound4.second = sizeof(bound4.first);
-            getsockname(s4, (sockaddr*)&bound4.first, &bound4.second);
-        }
-    }
-
-#if 1
-    bound6 = {};
-    if (sin6) {
-        s6 = socket(PF_INET6, SOCK_DGRAM, 0);
-        if(s6 >= 0) {
-            int val = 1;
-            int rc = setsockopt(s6, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&val, sizeof(val));
-            if(rc < 0)
-                throw DhtException("Can't set IPV6_V6ONLY");
-
-            rc = bind(s6, (sockaddr*)sin6, sizeof(sockaddr_in6));
-            if(rc < 0)
-                throw DhtException("Can't bind IPv6 socket on " + dht::print_addr((sockaddr*)sin6, sizeof(sockaddr_in6)));
-            bound6.second = sizeof(bound6.first);
-            getsockname(s6, (sockaddr*)&bound6.first, &bound6.second);
-        }
-    }
-#endif
-
-    dht_ = std::unique_ptr<SecureDht>(new SecureDht {s4, s6, config});
-
-    rcv_thread = std::thread([this,s4,s6]() {
-        try {
-            while (true) {
-                struct timeval tv {/*.tv_sec = */0, /*.tv_usec = */250000};
-                fd_set readfds;
-
-                FD_ZERO(&readfds);
-                if(s4 >= 0)
-                    FD_SET(s4, &readfds);
-                if(s6 >= 0)
-                    FD_SET(s6, &readfds);
-
-                int rc = select(s4 > s6 ? s4 + 1 : s6 + 1, &readfds, nullptr, nullptr, &tv);
-                if(rc < 0) {
-                    if(errno != EINTR) {
-                        perror("select");
-                        std::this_thread::sleep_for( std::chrono::seconds(1) );
-                    }
-                }
-
-                if(!running)
-                    break;
-
-                if(rc > 0) {
-                    std::array<uint8_t, 1024 * 64> buf;
-                    SockAddr from;
-                    from.second = sizeof(from.first);
-
-                    if(s4 >= 0 && FD_ISSET(s4, &readfds))
-                        rc = recvfrom(s4, (char*)buf.data(), buf.size(), 0, (struct sockaddr*)&from.first, &from.second);
-                    else if(s6 >= 0 && FD_ISSET(s6, &readfds))
-                        rc = recvfrom(s6, (char*)buf.data(), buf.size(), 0, (struct sockaddr*)&from.first, &from.second);
-                    else
-                        break;
-                    if (rc > 0) {
-                        {
-                            std::lock_guard<std::mutex> lck(sock_mtx);
-                            rcv.emplace_back(Blob {buf.begin(), buf.begin()+rc+1}, from);
-                        }
-                        cv.notify_all();
-                    }
-                }
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Error in DHT networking thread: " << e.what() << std::endl;
-        }
-        if (s4 >= 0)
-            close(s4);
-        if (s6 >= 0)
-            close(s6);
-    });
+    dht_ = std::unique_ptr<SecureDht>(new SecureDht {uv_loop_.get(), config});
 }
 
 void
@@ -476,10 +305,11 @@ DhtRunner::get(InfoHash hash, GetCallback vcb, DoneCallback dcb, Value::Filter f
     {
         std::lock_guard<std::mutex> lck(storage_mtx);
         pending_ops.emplace([=](SecureDht& dht) mutable {
+            std::cout << "DhtRunner dht.get " << hash << std::endl;
             dht.get(hash, vcb, dcb, std::move(f), std::move(w));
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -494,7 +324,7 @@ void DhtRunner::query(const InfoHash& hash, QueryCallback cb, DoneCallback done_
             dht.query(hash, cb, done_cb, std::move(q));
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 std::future<size_t>
@@ -507,7 +337,7 @@ DhtRunner::listen(InfoHash hash, GetCallback vcb, Value::Filter f, Where w)
             ret_token->set_value(dht.listen(hash, vcb, std::move(f), std::move(w)));
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
     return ret_token->get_future();
 }
 
@@ -526,7 +356,7 @@ DhtRunner::cancelListen(InfoHash h, size_t token)
             dht.cancelListen(h, token);
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -539,7 +369,7 @@ DhtRunner::cancelListen(InfoHash h, std::shared_future<size_t> token)
             dht.cancelListen(h, tk);
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -552,7 +382,7 @@ DhtRunner::put(InfoHash hash, Value&& value, DoneCallback cb, time_point created
             dht.put(hash, sv, cb, created, permanent);
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -564,7 +394,7 @@ DhtRunner::put(InfoHash hash, std::shared_ptr<Value> value, DoneCallback cb, tim
             dht.put(hash, value, cb, created, permanent);
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -582,7 +412,7 @@ DhtRunner::cancelPut(const InfoHash& h , const Value::Id& id)
             dht.cancelPut(h, id);
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -594,7 +424,7 @@ DhtRunner::putSigned(InfoHash hash, std::shared_ptr<Value> value, DoneCallback c
             dht.putSigned(hash, value, cb);
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -618,7 +448,7 @@ DhtRunner::putEncrypted(InfoHash hash, InfoHash to, std::shared_ptr<Value> value
             dht.putEncrypted(hash, to, value, cb);
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -748,7 +578,7 @@ DhtRunner::bootstrap(const std::vector<std::pair<sockaddr_storage, socklen_t>>& 
                     cb(r.second);
             } : DoneCallbackSimple{});
     });
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -761,7 +591,7 @@ DhtRunner::bootstrap(const std::vector<NodeExport>& nodes)
                 dht.insertNode(node);
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -773,7 +603,7 @@ DhtRunner::connectivityChanged()
             dht.connectivityChanged();
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 void
@@ -784,7 +614,7 @@ DhtRunner::findCertificate(InfoHash hash, std::function<void(const std::shared_p
             dht.findCertificate(hash, cb);
         });
     }
-    cv.notify_all();
+    uv_async_send(&uv_async_);
 }
 
 }

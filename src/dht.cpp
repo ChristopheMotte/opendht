@@ -46,32 +46,6 @@ extern "C" {
 #include <fcntl.h>
 #include <cstring>
 
-#ifdef _WIN32
-
-static bool
-set_nonblocking(int fd, int nonblocking)
-{
-    unsigned long mode = !!nonblocking;
-    int rc = ioctlsocket(fd, FIONBIO, &mode);
-    return rc == 0;
-}
-
-extern const char *inet_ntop(int, const void *, char *, socklen_t);
-
-#else
-
-static bool
-set_nonblocking(int fd, int nonblocking)
-{
-    int rc = fcntl(fd, F_GETFL, 0);
-    if (rc < 0)
-        return false;
-    rc = fcntl(fd, F_SETFL, nonblocking?(rc | O_NONBLOCK):(rc & ~O_NONBLOCK));
-    return rc >= 0;
-}
-
-#endif
-
 namespace dht {
 
 using namespace std::placeholders;
@@ -515,7 +489,7 @@ struct Dht::Search {
     uint16_t tid;
     time_point refill_time {time_point::min()};
     time_point step_time {time_point::min()};           /* the time of the last search step */
-    Sp<Scheduler::Job> nextSearchStep {};
+    Sp<Job> nextSearchStep {};
 
     bool expired {false};              /* no node, or all nodes expired */
     bool done {false};                 /* search is over, cached for later */
@@ -785,8 +759,16 @@ Dht::getStatus(sa_family_t af) const
 void
 Dht::shutdown(ShutdownCallback cb)
 {
+    auto final_shutdown = [this,cb](){
+        scheduler.stop();
+        DHT_LOG.w("closing socket...");
+        network_engine.close([=](){
+            if (cb)
+                cb();
+        });
+    };
     if (not maintain_storage) {
-        if (cb) cb();
+        final_shutdown();
         return;
     }
 
@@ -796,7 +778,7 @@ Dht::shutdown(ShutdownCallback cb)
     auto str_donecb = [=](bool, const std::vector<Sp<Node>>&) {
         --*remaining;
         DHT_LOG.w("shuting down node: %u ops remaining", *remaining);
-        if (!*remaining && cb) { cb(); }
+        if (!*remaining) { final_shutdown(); }
     };
 
     for (auto& str : store)
@@ -804,8 +786,7 @@ Dht::shutdown(ShutdownCallback cb)
 
     if (!*remaining) {
         DHT_LOG.w("shuting down node: %u ops remaining", *remaining);
-        if (cb)
-            cb();
+        final_shutdown();
     }
 }
 
@@ -1786,7 +1767,7 @@ Dht::search(const InfoHash& id, sa_family_t af, GetCallback gcb, QueryCallback q
     if (sr->nextSearchStep)
         scheduler.edit(sr->nextSearchStep, sr->getNextStepTime(scheduler.time()));
     else
-        sr->nextSearchStep = scheduler.add(scheduler.time(), std::bind(&Dht::searchStep, this, sr));
+        sr->nextSearchStep = scheduler.run(std::bind(&Dht::searchStep, this, sr));
 
     return sr;
 }
@@ -2546,7 +2527,7 @@ Dht::rotateSecrets()
         crypto::random_device rdev;
         std::generate_n(secret.begin(), secret.size(), std::bind(rand_byte, std::ref(rdev)));
     }
-    scheduler.add(rotate_secrets_time, std::bind(&Dht::rotateSecrets, this));
+    scheduler.edit(nextSecretRotation, rotate_secrets_time);
 }
 
 Blob
@@ -2879,14 +2860,14 @@ Dht::~Dht()
         s.second->clear();
 }
 
-Dht::Dht() : store(), scheduler(DHT_LOG), network_engine(DHT_LOG, scheduler) {}
+Dht::Dht() : store(), scheduler(nullptr, DHT_LOG), network_engine(nullptr, DHT_LOG, scheduler) {}
 
-Dht::Dht(int s, int s6, Config config)
+Dht::Dht(uv_loop_t* loop, Config config)
     : myid(config.node_id != zeroes ? config.node_id : InfoHash::getRandom()),
-    is_bootstrap(config.is_bootstrap),
-    maintain_storage(config.maintain_storage), store(), store_quota(),
-    scheduler(DHT_LOG),
-    network_engine(myid, config.network, s, s6, DHT_LOG, scheduler,
+    is_bootstrap(config.is_bootstrap), maintain_storage(config.maintain_storage),
+    buckets4{Bucket {AF_INET}},buckets6{Bucket {AF_INET6}}, store(), store_quota(),
+    scheduler(loop, DHT_LOG),
+    network_engine(loop, config.port, myid, config.network, DHT_LOG, scheduler,
             std::bind(&Dht::onError, this, _1, _2),
             std::bind(&Dht::onNewNode, this, _1, _2),
             std::bind(&Dht::onReportedAddr, this, _1, _2),
@@ -2898,27 +2879,10 @@ Dht::Dht(int s, int s6, Config config)
             std::bind(&Dht::onRefresh, this, _1, _2, _3, _4))
 {
     scheduler.syncTime();
-    if (s < 0 && s6 < 0)
-        return;
-
-    if (s >= 0) {
-        buckets4 = {Bucket {AF_INET}};
-        if (!set_nonblocking(s, 1))
-            throw DhtException("Can't set socket to non-blocking mode");
-    }
-
-    if (s6 >= 0) {
-        buckets6 = {Bucket {AF_INET6}};
-        if (!set_nonblocking(s6, 1))
-            throw DhtException("Can't set socket to non-blocking mode");
-    }
-
     search_id = std::uniform_int_distribution<decltype(search_id)>{}(rd);
 
     uniform_duration_distribution<> time_dis {std::chrono::seconds(3), std::chrono::seconds(5)};
-    auto confirm_nodes_time = scheduler.time() + time_dis(rd);
-    DHT_LOG.d(myid, "Scheduling %s", myid.toString().c_str());
-    nextNodesConfirmation = scheduler.add(confirm_nodes_time, std::bind(&Dht::confirmNodes, this));
+    nextNodesConfirmation = scheduler.add(time_dis(rd), std::bind(&Dht::confirmNodes, this));
 
     // Fill old secret
     {
@@ -3089,45 +3053,15 @@ Dht::maintainStorage(decltype(store)::value_type& storage, bool force, DoneCallb
 }
 
 void
-Dht::processMessage(const uint8_t *buf, size_t buflen, const SockAddr& from)
-{
-    if (buflen == 0)
-        return;
-
-    try {
-        network_engine.processMessage(buf, buflen, from);
-    } catch (const std::exception& e) {
-        DHT_LOG.e("Can't parse message from %s: %s", from.toString().c_str(), e.what());
-        //auto code = e.getCode();
-        //if (code == net::DhtProtocolException::INVALID_TID_SIZE or code == net::DhtProtocolException::WRONG_NODE_INFO_BUF_LEN) {
-            /* This is really annoying, as it means that we will
-               time-out all our searches that go through this node.
-               Kill it. */
-            //const auto& id = e.getNodeId();
-            //blacklistNode(&id, from, fromlen);
-        ///}
-    }
-}
-
-time_point
-Dht::periodic(const uint8_t *buf, size_t buflen, const SockAddr& from)
-{
-    scheduler.syncTime();
-    processMessage(buf, buflen, from);
-    return scheduler.run();
-}
-
-void
 Dht::expire()
 {
     uniform_duration_distribution<> time_dis(std::chrono::minutes(2), std::chrono::minutes(6));
-    auto expire_stuff_time = scheduler.time() + duration(time_dis(rd));
 
     expireBuckets(buckets4);
     expireBuckets(buckets6);
     expireStore();
     expireSearches();
-    scheduler.add(expire_stuff_time, std::bind(&Dht::expire, this));
+    scheduler.add(time_dis(rd), std::bind(&Dht::expire, this));
 }
 
 void
@@ -3163,9 +3097,7 @@ Dht::confirmNodes()
     auto time_dis = soon
         ? uniform_duration_distribution<> {seconds(5) , seconds(25)}
         : uniform_duration_distribution<> {seconds(60), seconds(180)};
-    auto confirm_nodes_time = now + time_dis(rd);
-
-    scheduler.edit(nextNodesConfirmation, confirm_nodes_time);
+    scheduler.edit(nextNodesConfirmation, now + time_dis(rd));
 }
 
 std::vector<ValuesExport>

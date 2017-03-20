@@ -48,9 +48,6 @@ struct Request;
 /**
  * Main Dht class.
  * Provides a Distributed Hash Table node.
- *
- * Must be given open UDP sockets and ::periodic must be
- * called regularly.
  */
 class OPENDHT_PUBLIC Dht {
 public:
@@ -67,7 +64,7 @@ public:
      * Initialise the Dht with two open sockets (for IPv4 and IP6)
      * and an ID for the node.
      */
-    Dht(int s, int s6, Config config);
+    Dht(uv_loop_t* loop, Config config);
     virtual ~Dht();
 
     /**
@@ -131,11 +128,6 @@ public:
     }
 
     void pingNode(const sockaddr*, socklen_t, DoneCallbackSimple&& cb={});
-
-    time_point periodic(const uint8_t *buf, size_t buflen, const SockAddr&);
-    time_point periodic(const uint8_t *buf, size_t buflen, const sockaddr* from, socklen_t fromlen) {
-        return periodic(buf, buflen, SockAddr(from, fromlen));
-    }
 
     /**
      * Get a value by searching on all available protocols (IPv4, IPv6),
@@ -301,6 +293,10 @@ public:
 
     std::vector<SockAddr> getPublicAddress(sa_family_t family = 0);
 
+    SockAddr getBoundAddr() {
+        return network_engine.getBoundAddr();
+    }
+
 protected:
     Logger DHT_LOG;
     bool logFilerEnable_ {};
@@ -402,8 +398,8 @@ private:
 
     // timing
     Scheduler scheduler;
-    Sp<Scheduler::Job> nextNodesConfirmation {};
-    Sp<Scheduler::Job> nextStorageMaintenance {};
+    Sp<Job> nextNodesConfirmation {};
+    Sp<Job> nextSecretRotation {};
     time_point mybucket_grow_time {time_point::min()}, mybucket6_grow_time {time_point::min()};
 
     net::NetworkEngine network_engine;
@@ -554,8 +550,6 @@ private:
     void dumpSearch(const Search& sr, std::ostream& out) const;
 
     bool neighbourhoodMaintenance(RoutingTable&);
-
-    void processMessage(const uint8_t *buf, size_t buflen, const SockAddr&);
 
     void onError(Sp<net::Request> node, net::DhtProtocolException e);
     /* when our address is reported by a distant peer. */

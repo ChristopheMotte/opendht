@@ -26,6 +26,8 @@
 #define IN_IS_ADDR_UNSPECIFIED(a) (((long int) (a)->s_addr) == 0x00000000)
 #endif /* IN_IS_ADDR_UNSPECIFIED */
 
+static constexpr std::array<uint8_t, 12> MAPPED_IPV4_PREFIX {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}};
+
 namespace dht {
 
 std::string
@@ -115,6 +117,30 @@ SockAddr::isPrivate() const
     default:
         return false;
     }
+}
+
+bool
+SockAddr::isMappedIPv4() const
+{
+    if (getFamily() != AF_INET6)
+        return false;
+    const uint8_t* addr6 = reinterpret_cast<const uint8_t*>(&getIPv6().sin6_addr);
+    return std::equal(MAPPED_IPV4_PREFIX.begin(), MAPPED_IPV4_PREFIX.end(), addr6);
+}
+
+SockAddr
+SockAddr::getMappedIPv4() const
+{
+    if (getFamily() != AF_INET6)
+        return *this;
+    SockAddr ret;
+    ret.setFamily(AF_INET);
+    ret.setPort(getPort());
+    auto addr6 = reinterpret_cast<const uint8_t*>(&getIPv6().sin6_addr);
+    auto addr4 = reinterpret_cast<uint8_t*>(&ret.getIPv4().sin_addr);
+    addr6 += MAPPED_IPV4_PREFIX.size();
+    std::copy_n(addr6, sizeof(in_addr), addr4);
+    return ret;
 }
 
 bool operator==(const SockAddr& a, const SockAddr& b) {
