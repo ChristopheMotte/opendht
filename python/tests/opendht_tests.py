@@ -16,7 +16,7 @@ class OpenDhtTester(unittest.TestCase):
         a.run()
         b = dht.DhtRunner()
         b.run()
-        self.assertTrue(b.bootstrap(a.getBound()))
+        self.assertTrue(b.ping(a.getBound()))
 
 if __name__ == '__main__':
     unittest.main()
