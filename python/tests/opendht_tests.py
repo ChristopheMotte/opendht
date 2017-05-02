@@ -1,6 +1,7 @@
 import unittest
 import opendht as dht
 import time
+import asyncio
 
 class OpenDhtTester(unittest.TestCase):
 
@@ -18,6 +19,7 @@ class OpenDhtTester(unittest.TestCase):
         b = dht.DhtRunner()
         b.run()
         self.assertTrue(b.ping(a.getBound()))
+        del a,b
 
     def test_crypto(self):
         i = dht.Identity.generate("id")
@@ -60,6 +62,30 @@ class OpenDhtTester(unittest.TestCase):
         a.put(dht.InfoHash.get('key'), dht.Value(b"value"))
         #time.sleep(0.0075)
         self.assertEqual(b"value", b.get(dht.InfoHash.get('key'))[0].data)
+        del a,b
+
+    # test the listen() function
+    def test_listen(self):
+        a = dht.DhtRunner()
+        a.run()
+        b = dht.DhtRunner()
+        b.run()
+        b.ping(a.getBound())
+
+        ok = False
+        loop = asyncio.get_event_loop()
+
+        def cb():
+            ok = True
+            loop.stop()
+
+        a.listen(dht.InfoHash.get('key'), lambda v: cb())
+
+        b.put(dht.InfoHash.get('key'), dht.Value(b"value"))
+
+        loop.run_forever()
+
+        assertTrue(ok)
 
 if __name__ == '__main__':
     unittest.main()
