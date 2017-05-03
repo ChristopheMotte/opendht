@@ -59,6 +59,7 @@ class OpenDhtTester(unittest.TestCase):
         b = dht.DhtRunner()
         b.run()
         b.ping(a.getBound())
+
         key = dht.InfoHash.get('key')
         value = b'value'
         a.put(key, dht.Value(value))
@@ -66,7 +67,7 @@ class OpenDhtTester(unittest.TestCase):
         self.assertEqual(b.get(key)[0].data, value)
         del a,b
 
-    # tests the listen() function
+    # test the listen() function
     def test_listen(self):
         a = dht.DhtRunner()
         a.run()
